@@ -1,5 +1,5 @@
-;; RideLink - Decentralized Ride-Sharing Escrow System
-;; A smart contract for secure ride-sharing transactions
+;; RideLink - Decentralized Ride-Sharing Escrow System with Dispute Resolution
+;; A smart contract for secure ride-sharing transactions with staked mediator system
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -9,17 +9,40 @@
 (define-constant err-invalid-status (err u103))
 (define-constant err-insufficient-funds (err u104))
 (define-constant err-already-exists (err u105))
+(define-constant err-invalid-rating (err u106))
+(define-constant err-dispute-window-closed (err u107))
+(define-constant err-dispute-already-exists (err u108))
+(define-constant err-voting-period-ended (err u109))
+(define-constant err-voting-period-active (err u110))
+(define-constant err-already-voted (err u111))
+(define-constant err-not-mediator (err u112))
+(define-constant err-mediator-cooldown (err u113))
+(define-constant err-invalid-vote (err u114))
+(define-constant err-insufficient-stake (err u115))
 
 ;; Data Variables
 (define-data-var ride-counter uint u0)
 (define-data-var platform-fee uint u50) ;; 0.5% in basis points
+(define-data-var mediator-stake-required uint u1000000000) ;; 1000 STX in microSTX
+(define-data-var dispute-window uint u144) ;; 24 hours in blocks (assuming 10min blocks)
+(define-data-var voting-period uint u288) ;; 48 hours in blocks
+(define-data-var mediator-cooldown uint u1008) ;; 7 days in blocks
+(define-data-var stake-slash-rate uint u1000) ;; 10% in basis points
 
-;; Ride status enum
+;; Status constants
 (define-constant status-requested u1)
 (define-constant status-accepted u2)
 (define-constant status-in-progress u3)
 (define-constant status-completed u4)
 (define-constant status-cancelled u5)
+
+;; Dispute status constants
+(define-constant dispute-status-active u1)
+(define-constant dispute-status-resolved u2)
+
+;; Vote constants
+(define-constant vote-for-rider u1)
+(define-constant vote-for-driver u2)
 
 ;; Data Maps
 (define-map rides
@@ -49,6 +72,38 @@
   uint
 )
 
+(define-map mediators
+  principal
+  {
+    stake: uint,
+    is-active: bool,
+    registered-at: uint,
+    unregistered-at: (optional uint)
+  }
+)
+
+(define-map disputes
+  uint ;; ride-id
+  {
+    raised-by: principal,
+    raised-at: uint,
+    voting-ends-at: uint,
+    status: uint,
+    votes-for-rider: uint,
+    votes-for-driver: uint,
+    resolved-at: (optional uint),
+    resolution: (optional uint)
+  }
+)
+
+(define-map dispute-votes
+  {dispute-id: uint, mediator: principal}
+  {
+    vote: uint,
+    voted-at: uint
+  }
+)
+
 ;; Private Functions
 (define-private (get-next-ride-id)
   (begin
@@ -59,6 +114,18 @@
 
 (define-private (calculate-platform-fee (amount uint))
   (/ (* amount (var-get platform-fee)) u10000)
+)
+
+(define-private (is-within-dispute-window (completed-at uint))
+  (<= (- stacks-block-height completed-at) (var-get dispute-window))
+)
+
+(define-private (is-voting-period-active (voting-ends-at uint))
+  (< stacks-block-height voting-ends-at)
+)
+
+(define-private (calculate-slash-amount (stake uint))
+  (/ (* stake (var-get stake-slash-rate)) u10000)
 )
 
 ;; Public Functions
@@ -123,7 +190,7 @@
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
     (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
     (platform-fee-amount (calculate-platform-fee (get fare ride-data)))
-    (driver-payment (- (get fare ride-data) u0))
+    (driver-payment (get fare ride-data))
   )
     (asserts! (is-eq (some tx-sender) (get driver ride-data)) err-unauthorized)
     (asserts! (is-eq (get status ride-data) status-in-progress) err-invalid-status)
@@ -156,7 +223,7 @@
   )
     (asserts! (is-eq tx-sender (get rider ride-data)) err-unauthorized)
     (asserts! (is-eq (get status ride-data) status-completed) err-invalid-status)
-    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-status)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
     
     (map-set driver-ratings driver-principal {
       total-rating: (+ (get total-rating current-rating) rating),
@@ -193,6 +260,146 @@
   )
 )
 
+;; Register as mediator
+(define-public (register-mediator)
+  (let (
+    (existing-mediator (map-get? mediators tx-sender))
+    (required-stake (var-get mediator-stake-required))
+  )
+    (asserts! (is-none existing-mediator) err-already-exists)
+    (try! (stx-transfer? required-stake tx-sender (as-contract tx-sender)))
+    (map-set mediators tx-sender {
+      stake: required-stake,
+      is-active: true,
+      registered-at: stacks-block-height,
+      unregistered-at: none
+    })
+    (ok true)
+  )
+)
+
+;; Unregister as mediator
+(define-public (unregister-mediator)
+  (let (
+    (mediator-data (unwrap! (map-get? mediators tx-sender) err-not-found))
+    (stake-amount (get stake mediator-data))
+  )
+    (asserts! (get is-active mediator-data) err-not-mediator)
+    
+    ;; Set as inactive and record unregistration time
+    (map-set mediators tx-sender (merge mediator-data {
+      is-active: false,
+      unregistered-at: (some stacks-block-height)
+    }))
+    
+    ;; Return stake after cooldown check (simplified - in production, would need separate withdrawal function)
+    (try! (as-contract (stx-transfer? stake-amount tx-sender tx-sender)))
+    
+    (ok true)
+  )
+)
+
+;; Raise dispute
+(define-public (raise-dispute (ride-id uint))
+  (let (
+    (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
+    (completed-at (unwrap! (get completed-at ride-data) err-invalid-status))
+    (voting-ends-at (+ stacks-block-height (var-get voting-period)))
+  )
+    (asserts! (is-eq (get status ride-data) status-completed) err-invalid-status)
+    (asserts! (or 
+      (is-eq tx-sender (get rider ride-data))
+      (is-eq (some tx-sender) (get driver ride-data))
+    ) err-unauthorized)
+    (asserts! (is-within-dispute-window completed-at) err-dispute-window-closed)
+    (asserts! (is-none (map-get? disputes ride-id)) err-dispute-already-exists)
+    
+    (map-set disputes ride-id {
+      raised-by: tx-sender,
+      raised-at: stacks-block-height,
+      voting-ends-at: voting-ends-at,
+      status: dispute-status-active,
+      votes-for-rider: u0,
+      votes-for-driver: u0,
+      resolved-at: none,
+      resolution: none
+    })
+    (ok true)
+  )
+)
+
+;; Vote on dispute (mediator)
+(define-public (vote-on-dispute (ride-id uint) (vote uint))
+  (let (
+    (dispute-data (unwrap! (map-get? disputes ride-id) err-not-found))
+    (mediator-data (unwrap! (map-get? mediators tx-sender) err-not-mediator))
+    (vote-key {dispute-id: ride-id, mediator: tx-sender})
+  )
+    (asserts! (get is-active mediator-data) err-not-mediator)
+    (asserts! (is-eq (get status dispute-data) dispute-status-active) err-invalid-status)
+    (asserts! (is-voting-period-active (get voting-ends-at dispute-data)) err-voting-period-ended)
+    (asserts! (is-none (map-get? dispute-votes vote-key)) err-already-voted)
+    (asserts! (or (is-eq vote vote-for-rider) (is-eq vote vote-for-driver)) err-invalid-vote)
+    
+    ;; Record vote
+    (map-set dispute-votes vote-key {
+      vote: vote,
+      voted-at: stacks-block-height
+    })
+    
+    ;; Update vote counts
+    (if (is-eq vote vote-for-rider)
+      (map-set disputes ride-id (merge dispute-data {
+        votes-for-rider: (+ (get votes-for-rider dispute-data) u1)
+      }))
+      (map-set disputes ride-id (merge dispute-data {
+        votes-for-driver: (+ (get votes-for-driver dispute-data) u1)
+      }))
+    )
+    (ok true)
+  )
+)
+
+;; Finalize dispute
+(define-public (finalize-dispute (ride-id uint))
+  (let (
+    (dispute-data (unwrap! (map-get? disputes ride-id) err-not-found))
+    (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
+    (votes-for-rider (get votes-for-rider dispute-data))
+    (votes-for-driver (get votes-for-driver dispute-data))
+    (total-votes (+ votes-for-rider votes-for-driver))
+    (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
+  )
+    (asserts! (is-eq (get status dispute-data) dispute-status-active) err-invalid-status)
+    (asserts! (not (is-voting-period-active (get voting-ends-at dispute-data))) err-voting-period-active)
+    (asserts! (> total-votes u0) err-invalid-status)
+    
+    ;; Determine winner and process payment
+    (let (
+      (resolution (if (> votes-for-rider votes-for-driver) vote-for-rider vote-for-driver))
+    )
+      (if (is-eq resolution vote-for-rider)
+        ;; Refund to rider
+        (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
+        ;; Pay driver (platform fee already deducted in complete-ride)
+        (try! (as-contract (stx-transfer? escrowed-amount tx-sender (unwrap! (get driver ride-data) err-not-found))))
+      )
+      
+      ;; Update dispute status
+      (map-set disputes ride-id (merge dispute-data {
+        status: dispute-status-resolved,
+        resolved-at: (some stacks-block-height),
+        resolution: (some resolution)
+      }))
+      
+      ;; Clear escrow
+      (map-delete escrow-balances ride-id)
+      
+      (ok resolution)
+    )
+  )
+)
+
 ;; Read-only functions
 
 ;; Get ride details
@@ -225,4 +432,42 @@
 ;; Get total rides
 (define-read-only (get-total-rides)
   (var-get ride-counter)
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (ride-id uint))
+  (map-get? disputes ride-id)
+)
+
+;; Get mediator information
+(define-read-only (get-mediator (mediator principal))
+  (map-get? mediators mediator)
+)
+
+;; Check if mediator is active
+(define-read-only (is-mediator-active (mediator principal))
+  (match (map-get? mediators mediator)
+    mediator-data (get is-active mediator-data)
+    false
+  )
+)
+
+;; Get mediator stake
+(define-read-only (get-mediator-stake (mediator principal))
+  (match (map-get? mediators mediator)
+    mediator-data (some (get stake mediator-data))
+    none
+  )
+)
+
+;; Get dispute votes
+(define-read-only (get-dispute-votes (ride-id uint))
+  (match (map-get? disputes ride-id)
+    dispute-data {
+      votes-for-rider: (get votes-for-rider dispute-data),
+      votes-for-driver: (get votes-for-driver dispute-data),
+      total-votes: (+ (get votes-for-rider dispute-data) (get votes-for-driver dispute-data))
+    }
+    {votes-for-rider: u0, votes-for-driver: u0, total-votes: u0}
+  )
 )
