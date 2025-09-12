@@ -1,5 +1,5 @@
-;; RideLink - Decentralized Ride-Sharing Escrow System with Dispute Resolution
-;; A smart contract for secure ride-sharing transactions with staked mediator system
+;; RideLink - Decentralized Ride-Sharing Escrow System with Dispute Resolution & Dynamic Pricing
+;; A smart contract for secure ride-sharing transactions with staked mediator system and surge pricing
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -19,6 +19,8 @@
 (define-constant err-mediator-cooldown (err u113))
 (define-constant err-invalid-vote (err u114))
 (define-constant err-insufficient-stake (err u115))
+(define-constant err-invalid-multiplier (err u116))
+(define-constant err-invalid-location (err u117))
 
 ;; Data Variables
 (define-data-var ride-counter uint u0)
@@ -28,6 +30,10 @@
 (define-data-var voting-period uint u288) ;; 48 hours in blocks
 (define-data-var mediator-cooldown uint u1008) ;; 7 days in blocks
 (define-data-var stake-slash-rate uint u1000) ;; 10% in basis points
+(define-data-var base-surge-multiplier uint u10000) ;; 1.0x in basis points (10000 = 100%)
+(define-data-var max-surge-multiplier uint u50000) ;; 5.0x max surge in basis points
+(define-data-var demand-threshold uint u5) ;; Minimum demand for surge pricing
+(define-data-var supply-threshold uint u2) ;; Minimum supply for normal pricing
 
 ;; Status constants
 (define-constant status-requested u1)
@@ -53,6 +59,8 @@
     pickup-location: (string-ascii 100),
     destination: (string-ascii 100),
     fare: uint,
+    base-fare: uint,
+    surge-multiplier: uint,
     status: uint,
     created-at: uint,
     completed-at: (optional uint)
@@ -104,6 +112,26 @@
   }
 )
 
+;; Location-based demand tracking
+(define-map location-demand
+  (string-ascii 100) ;; location identifier
+  {
+    active-requests: uint,
+    available-drivers: uint,
+    last-updated: uint
+  }
+)
+
+;; Surge pricing history for analytics
+(define-map surge-history
+  {location: (string-ascii 100), block-height: uint}
+  {
+    multiplier: uint,
+    demand: uint,
+    supply: uint
+  }
+)
+
 ;; Private Functions
 (define-private (get-next-ride-id)
   (begin
@@ -128,40 +156,124 @@
   (/ (* stake (var-get stake-slash-rate)) u10000)
 )
 
+(define-private (min-uint (a uint) (b uint))
+  (if (<= a b) a b)
+)
+
+(define-private (calculate-surge-multiplier (demand uint) (supply uint))
+  (let (
+    (demand-threshold-val (var-get demand-threshold))
+    (supply-threshold-val (var-get supply-threshold))
+    (base-multiplier (var-get base-surge-multiplier))
+    (max-multiplier (var-get max-surge-multiplier))
+  )
+    (if (and (>= demand demand-threshold-val) (<= supply supply-threshold-val))
+      (let (
+        (demand-ratio (if (> supply u0) (/ (* demand u10000) supply) u10000))
+        (surge-multiplier (min-uint 
+          max-multiplier 
+          (+ base-multiplier (/ (* demand-ratio u1000) u100))
+        ))
+      )
+        surge-multiplier
+      )
+      base-multiplier
+    )
+  )
+)
+
+(define-private (apply-surge-pricing (base-fare uint) (multiplier uint))
+  (/ (* base-fare multiplier) u10000)
+)
+
+(define-private (update-location-demand (location (string-ascii 100)) (demand-change int) (supply-change int))
+  (let (
+    (current-data (default-to 
+      {active-requests: u0, available-drivers: u0, last-updated: u0}
+      (map-get? location-demand location)
+    ))
+    (new-demand (if (>= demand-change 0) 
+      (+ (get active-requests current-data) (to-uint demand-change))
+      (if (>= (get active-requests current-data) (to-uint (- 0 demand-change)))
+        (- (get active-requests current-data) (to-uint (- 0 demand-change)))
+        u0
+      )
+    ))
+    (new-supply (if (>= supply-change 0)
+      (+ (get available-drivers current-data) (to-uint supply-change))
+      (if (>= (get available-drivers current-data) (to-uint (- 0 supply-change)))
+        (- (get available-drivers current-data) (to-uint (- 0 supply-change)))
+        u0
+      )
+    ))
+  )
+    (map-set location-demand location {
+      active-requests: new-demand,
+      available-drivers: new-supply,
+      last-updated: stacks-block-height
+    })
+    {demand: new-demand, supply: new-supply}
+  )
+)
+
+(define-private (record-surge-history (location (string-ascii 100)) (multiplier uint) (demand uint) (supply uint))
+  (map-set surge-history 
+    {location: location, block-height: stacks-block-height}
+    {multiplier: multiplier, demand: demand, supply: supply}
+  )
+)
+
 ;; Public Functions
 
-;; Request a ride
-(define-public (request-ride (pickup (string-ascii 100)) (destination (string-ascii 100)) (fare uint))
+;; Request a ride with dynamic pricing
+(define-public (request-ride (pickup (string-ascii 100)) (destination (string-ascii 100)) (base-fare uint))
   (let (
     (ride-id (get-next-ride-id))
-    (platform-fee-amount (calculate-platform-fee fare))
-    (total-amount (+ fare platform-fee-amount))
+    (demand-supply (update-location-demand pickup 1 0))
+    (surge-multiplier (calculate-surge-multiplier (get demand demand-supply) (get supply demand-supply)))
+    (final-fare (apply-surge-pricing base-fare surge-multiplier))
+    (platform-fee-amount (calculate-platform-fee final-fare))
+    (total-amount (+ final-fare platform-fee-amount))
   )
-    (asserts! (> fare u0) err-insufficient-funds)
-    (asserts! (> (len pickup) u0) err-invalid-status)
-    (asserts! (> (len destination) u0) err-invalid-status)
+    (asserts! (> base-fare u0) err-insufficient-funds)
+    (asserts! (> (len pickup) u0) err-invalid-location)
+    (asserts! (> (len destination) u0) err-invalid-location)
+    (asserts! (<= surge-multiplier (var-get max-surge-multiplier)) err-invalid-multiplier)
+    
     (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
     (map-set rides ride-id {
       rider: tx-sender,
       driver: none,
       pickup-location: pickup,
       destination: destination,
-      fare: fare,
+      fare: final-fare,
+      base-fare: base-fare,
+      surge-multiplier: surge-multiplier,
       status: status-requested,
       created-at: stacks-block-height,
       completed-at: none
     })
+    
     (map-set escrow-balances ride-id total-amount)
-    (ok ride-id)
+    
+    ;; Record surge pricing history
+    (record-surge-history pickup surge-multiplier (get demand demand-supply) (get supply demand-supply))
+    
+    (ok {ride-id: ride-id, surge-multiplier: surge-multiplier, final-fare: final-fare})
   )
 )
 
-;; Accept a ride (driver)
+;; Accept a ride (driver) - updates supply metrics
 (define-public (accept-ride (ride-id uint))
   (let (
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
   )
     (asserts! (is-eq (get status ride-data) status-requested) err-invalid-status)
+    
+    ;; Update supply - one less available driver, one less active request
+    (update-location-demand (get pickup-location ride-data) -1 -1)
+    
     (map-set rides ride-id (merge ride-data {
       driver: (some tx-sender),
       status: status-accepted
@@ -184,19 +296,23 @@
   )
 )
 
-;; Complete ride (driver)
+;; Complete ride (driver) - driver becomes available again
 (define-public (complete-ride (ride-id uint))
   (let (
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
     (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
     (platform-fee-amount (calculate-platform-fee (get fare ride-data)))
     (driver-payment (get fare ride-data))
+    (driver-principal (unwrap! (get driver ride-data) err-not-found))
   )
     (asserts! (is-eq (some tx-sender) (get driver ride-data)) err-unauthorized)
     (asserts! (is-eq (get status ride-data) status-in-progress) err-invalid-status)
     
+    ;; Driver becomes available again
+    (update-location-demand (get pickup-location ride-data) 0 1)
+    
     ;; Transfer payment to driver
-    (try! (as-contract (stx-transfer? driver-payment tx-sender (unwrap! (get driver ride-data) err-not-found))))
+    (try! (as-contract (stx-transfer? driver-payment tx-sender driver-principal)))
     
     ;; Transfer platform fee to contract owner
     (try! (as-contract (stx-transfer? platform-fee-amount tx-sender contract-owner)))
@@ -233,7 +349,7 @@
   )
 )
 
-;; Cancel ride (rider or driver)
+;; Cancel ride (rider or driver) - adjusts demand/supply
 (define-public (cancel-ride (ride-id uint))
   (let (
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
@@ -244,6 +360,14 @@
       (is-eq (some tx-sender) (get driver ride-data))
     ) err-unauthorized)
     (asserts! (< (get status ride-data) status-in-progress) err-invalid-status)
+    
+    ;; Adjust demand/supply based on ride status
+    (if (is-eq (get status ride-data) status-accepted)
+      ;; If ride was accepted, driver becomes available again and request is removed
+      (update-location-demand (get pickup-location ride-data) -1 1)
+      ;; If ride was only requested, just remove the request
+      (update-location-demand (get pickup-location ride-data) -1 0)
+    )
     
     ;; Refund to rider
     (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
@@ -256,6 +380,24 @@
     ;; Clear escrow
     (map-delete escrow-balances ride-id)
     
+    (ok true)
+  )
+)
+
+;; Register as available driver for location-based supply
+(define-public (register-driver-availability (location (string-ascii 100)))
+  (begin
+    (asserts! (> (len location) u0) err-invalid-location)
+    (update-location-demand location 0 1)
+    (ok true)
+  )
+)
+
+;; Unregister driver availability
+(define-public (unregister-driver-availability (location (string-ascii 100)))
+  (begin
+    (asserts! (> (len location) u0) err-invalid-location)
+    (update-location-demand location 0 -1)
     (ok true)
   )
 )
@@ -400,11 +542,74 @@
   )
 )
 
+;; Admin function to update surge pricing parameters
+(define-public (update-surge-parameters (new-base-multiplier uint) (new-max-multiplier uint) (new-demand-threshold uint) (new-supply-threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= new-base-multiplier u5000) err-invalid-multiplier) ;; Min 0.5x
+    (asserts! (<= new-max-multiplier u100000) err-invalid-multiplier) ;; Max 10x
+    (asserts! (< new-base-multiplier new-max-multiplier) err-invalid-multiplier)
+    (asserts! (> new-demand-threshold u0) err-invalid-status)
+    (asserts! (> new-supply-threshold u0) err-invalid-status)
+    
+    (var-set base-surge-multiplier new-base-multiplier)
+    (var-set max-surge-multiplier new-max-multiplier)
+    (var-set demand-threshold new-demand-threshold)
+    (var-set supply-threshold new-supply-threshold)
+    (ok true)
+  )
+)
+
 ;; Read-only functions
 
 ;; Get ride details
 (define-read-only (get-ride (ride-id uint))
   (map-get? rides ride-id)
+)
+
+;; Get current surge pricing for location
+(define-read-only (get-current-surge-pricing (location (string-ascii 100)) (base-fare uint))
+  (let (
+    (location-data (default-to 
+      {active-requests: u0, available-drivers: u0, last-updated: u0}
+      (map-get? location-demand location)
+    ))
+    (demand (get active-requests location-data))
+    (supply (get available-drivers location-data))
+    (surge-multiplier (calculate-surge-multiplier demand supply))
+    (final-fare (apply-surge-pricing base-fare surge-multiplier))
+  )
+    {
+      surge-multiplier: surge-multiplier,
+      final-fare: final-fare,
+      base-fare: base-fare,
+      demand: demand,
+      supply: supply
+    }
+  )
+)
+
+;; Get location demand/supply data
+(define-read-only (get-location-metrics (location (string-ascii 100)))
+  (default-to 
+    {active-requests: u0, available-drivers: u0, last-updated: u0}
+    (map-get? location-demand location)
+  )
+)
+
+;; Get surge pricing parameters
+(define-read-only (get-surge-parameters)
+  {
+    base-multiplier: (var-get base-surge-multiplier),
+    max-multiplier: (var-get max-surge-multiplier),
+    demand-threshold: (var-get demand-threshold),
+    supply-threshold: (var-get supply-threshold)
+  }
+)
+
+;; Get surge history for location and block
+(define-read-only (get-surge-history (location (string-ascii 100)) (target-block uint))
+  (map-get? surge-history {location: location, block-height: target-block})
 )
 
 ;; Get driver rating
