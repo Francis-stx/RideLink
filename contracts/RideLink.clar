@@ -1,5 +1,18 @@
-;; RideLink - Decentralized Ride-Sharing Escrow System with Dispute Resolution & Dynamic Pricing
-;; A smart contract for secure ride-sharing transactions with staked mediator system and surge pricing
+;; RideLink - Decentralized Ride-Sharing Escrow System with Dispute Resolution, Dynamic Pricing & Multi-Token Support
+;; A smart contract for secure ride-sharing transactions with staked mediator system, surge pricing, and support for multiple payment tokens
+
+;; Define SIP-010 Trait locally for development
+(define-trait sip-010-trait
+  (
+    (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+    (get-name () (response (string-ascii 32) uint))
+    (get-symbol () (response (string-ascii 32) uint))
+    (get-decimals () (response uint uint))
+    (get-balance (principal) (response uint uint))
+    (get-total-supply () (response uint uint))
+    (get-token-uri () (response (optional (string-utf8 256)) uint))
+  )
+)
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -21,6 +34,11 @@
 (define-constant err-insufficient-stake (err u115))
 (define-constant err-invalid-multiplier (err u116))
 (define-constant err-invalid-location (err u117))
+(define-constant err-token-not-supported (err u118))
+(define-constant err-token-already-supported (err u119))
+(define-constant err-token-transfer-failed (err u120))
+(define-constant err-invalid-token-price (err u121))
+(define-constant err-token-not-active (err u122))
 
 ;; Data Variables
 (define-data-var ride-counter uint u0)
@@ -50,6 +68,10 @@
 (define-constant vote-for-rider u1)
 (define-constant vote-for-driver u2)
 
+;; Token type constants
+(define-constant token-type-stx u1)
+(define-constant token-type-sip010 u2)
+
 ;; Data Maps
 (define-map rides
   uint
@@ -63,7 +85,9 @@
     surge-multiplier: uint,
     status: uint,
     created-at: uint,
-    completed-at: (optional uint)
+    completed-at: (optional uint),
+    payment-token: principal,
+    token-type: uint
   }
 )
 
@@ -77,7 +101,11 @@
 
 (define-map escrow-balances
   uint
-  uint
+  {
+    amount: uint,
+    token: principal,
+    token-type: uint
+  }
 )
 
 (define-map mediators
@@ -132,6 +160,28 @@
   }
 )
 
+;; Supported payment tokens
+(define-map supported-tokens
+  principal ;; token contract principal
+  {
+    is-active: bool,
+    token-type: uint, ;; 1 for STX, 2 for SIP-010
+    price-in-stx: uint, ;; Price relative to STX (in basis points, 10000 = 1:1)
+    added-at: uint,
+    deactivated-at: (optional uint)
+  }
+)
+
+;; Token payment statistics
+(define-map token-stats
+  principal
+  {
+    total-rides: uint,
+    total-volume: uint,
+    last-used: uint
+  }
+)
+
 ;; Private Functions
 (define-private (get-next-ride-id)
   (begin
@@ -156,10 +206,6 @@
   (/ (* stake (var-get stake-slash-rate)) u10000)
 )
 
-(define-private (min-uint (a uint) (b uint))
-  (if (<= a b) a b)
-)
-
 (define-private (calculate-surge-multiplier (demand uint) (supply uint))
   (let (
     (demand-threshold-val (var-get demand-threshold))
@@ -170,8 +216,8 @@
     (if (and (>= demand demand-threshold-val) (<= supply supply-threshold-val))
       (let (
         (demand-ratio (if (> supply u0) (/ (* demand u10000) supply) u10000))
-        (surge-multiplier (min-uint 
-          max-multiplier 
+        (surge-multiplier (if (> (+ base-multiplier (/ (* demand-ratio u1000) u100)) max-multiplier)
+          max-multiplier
           (+ base-multiplier (/ (* demand-ratio u1000) u100))
         ))
       )
@@ -223,44 +269,156 @@
   )
 )
 
+(define-private (convert-token-to-stx (amount uint) (token-price uint))
+  (/ (* amount token-price) u10000)
+)
+
+(define-private (convert-stx-to-token (amount uint) (token-price uint))
+  (if (is-eq token-price u0)
+    u0
+    (/ (* amount u10000) token-price)
+  )
+)
+
+(define-private (update-token-stats (token principal) (amount uint))
+  (let (
+    (current-stats (default-to 
+      {total-rides: u0, total-volume: u0, last-used: u0}
+      (map-get? token-stats token)
+    ))
+  )
+    (map-set token-stats token {
+      total-rides: (+ (get total-rides current-stats) u1),
+      total-volume: (+ (get total-volume current-stats) amount),
+      last-used: stacks-block-height
+    })
+  )
+)
+
 ;; Public Functions
 
-;; Request a ride with dynamic pricing
-(define-public (request-ride (pickup (string-ascii 100)) (destination (string-ascii 100)) (base-fare uint))
-  (let (
-    (ride-id (get-next-ride-id))
-    (demand-supply (update-location-demand pickup 1 0))
-    (surge-multiplier (calculate-surge-multiplier (get demand demand-supply) (get supply demand-supply)))
-    (final-fare (apply-surge-pricing base-fare surge-multiplier))
-    (platform-fee-amount (calculate-platform-fee final-fare))
-    (total-amount (+ final-fare platform-fee-amount))
-  )
-    (asserts! (> base-fare u0) err-insufficient-funds)
-    (asserts! (> (len pickup) u0) err-invalid-location)
-    (asserts! (> (len destination) u0) err-invalid-location)
-    (asserts! (<= surge-multiplier (var-get max-surge-multiplier)) err-invalid-multiplier)
+;; Add supported payment token (owner only)
+(define-public (add-supported-token (token principal) (token-type-val uint) (price-in-stx uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-none (map-get? supported-tokens token)) err-token-already-supported)
+    (asserts! (or (is-eq token-type-val token-type-stx) (is-eq token-type-val token-type-sip010)) err-invalid-status)
+    (asserts! (> price-in-stx u0) err-invalid-token-price)
     
-    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
-    
-    (map-set rides ride-id {
-      rider: tx-sender,
-      driver: none,
-      pickup-location: pickup,
-      destination: destination,
-      fare: final-fare,
-      base-fare: base-fare,
-      surge-multiplier: surge-multiplier,
-      status: status-requested,
-      created-at: stacks-block-height,
-      completed-at: none
+    (map-set supported-tokens token {
+      is-active: true,
+      token-type: token-type-val,
+      price-in-stx: price-in-stx,
+      added-at: stacks-block-height,
+      deactivated-at: none
     })
+    (ok true)
+  )
+)
+
+;; Update token price (owner only)
+(define-public (update-token-price (token principal) (new-price uint))
+  (let (
+    (token-info (unwrap! (map-get? supported-tokens token) err-token-not-supported))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> new-price u0) err-invalid-token-price)
     
-    (map-set escrow-balances ride-id total-amount)
+    (map-set supported-tokens token (merge token-info {
+      price-in-stx: new-price
+    }))
+    (ok true)
+  )
+)
+
+;; Deactivate token (owner only)
+(define-public (deactivate-token (token principal))
+  (let (
+    (token-info (unwrap! (map-get? supported-tokens token) err-token-not-supported))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get is-active token-info) err-token-not-active)
     
-    ;; Record surge pricing history
-    (record-surge-history pickup surge-multiplier (get demand demand-supply) (get supply demand-supply))
+    (map-set supported-tokens token (merge token-info {
+      is-active: false,
+      deactivated-at: (some stacks-block-height)
+    }))
+    (ok true)
+  )
+)
+
+;; Reactivate token (owner only)
+(define-public (reactivate-token (token principal))
+  (let (
+    (token-info (unwrap! (map-get? supported-tokens token) err-token-not-supported))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (get is-active token-info)) err-token-already-supported)
     
-    (ok {ride-id: ride-id, surge-multiplier: surge-multiplier, final-fare: final-fare})
+    (map-set supported-tokens token (merge token-info {
+      is-active: true,
+      deactivated-at: none
+    }))
+    (ok true)
+  )
+)
+
+;; Request a ride with multi-token support
+(define-public (request-ride (pickup (string-ascii 100)) (destination (string-ascii 100)) (base-fare uint) (payment-token <sip-010-trait>))
+  (let
+    (
+      (token-principal (contract-of payment-token))
+      (token-info (unwrap! (map-get? supported-tokens token-principal) err-token-not-supported))
+      (ride-id (get-next-ride-id))
+      (demand-supply (update-location-demand pickup 1 0))
+      (surge-multiplier (calculate-surge-multiplier (get demand demand-supply) (get supply demand-supply)))
+      (final-fare (apply-surge-pricing base-fare surge-multiplier))
+      (platform-fee-amount (calculate-platform-fee final-fare))
+      (total-amount (+ final-fare platform-fee-amount))
+    )
+    ;; Function body starts here
+    (begin
+      (asserts! (get is-active token-info) err-token-not-active)
+      (asserts! (> base-fare u0) err-insufficient-funds)
+      (asserts! (> (len pickup) u0) err-invalid-location)
+      (asserts! (> (len destination) u0) err-invalid-location)
+      (asserts! (<= surge-multiplier (var-get max-surge-multiplier)) err-invalid-multiplier)
+      
+      ;; Transfer tokens to escrow based on token type
+      (if (is-eq (get token-type token-info) token-type-stx)
+        (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+        (unwrap! (contract-call? payment-token transfer total-amount tx-sender (as-contract tx-sender) none) err-token-transfer-failed)
+      )
+      
+      (map-set rides ride-id {
+        rider: tx-sender,
+        driver: none,
+        pickup-location: pickup,
+        destination: destination,
+        fare: final-fare,
+        base-fare: base-fare,
+        surge-multiplier: surge-multiplier,
+        status: status-requested,
+        created-at: stacks-block-height,
+        completed-at: none,
+        payment-token: token-principal,
+        token-type: (get token-type token-info)
+      })
+      
+      (map-set escrow-balances ride-id {
+        amount: total-amount,
+        token: token-principal,
+        token-type: (get token-type token-info)
+      })
+      
+      ;; Record surge pricing history
+      (record-surge-history pickup surge-multiplier (get demand demand-supply) (get supply demand-supply))
+      
+      ;; Update token statistics
+      (update-token-stats token-principal total-amount)
+      
+      (ok {ride-id: ride-id, surge-multiplier: surge-multiplier, final-fare: final-fare, token: token-principal})
+    )
   )
 )
 
@@ -296,26 +454,35 @@
   )
 )
 
-;; Complete ride (driver) - driver becomes available again
-(define-public (complete-ride (ride-id uint))
+;; Complete ride (driver) with multi-token payment support
+(define-public (complete-ride (ride-id uint) (payment-token <sip-010-trait>))
   (let (
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
-    (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
+    (escrow-data (unwrap! (map-get? escrow-balances ride-id) err-not-found))
     (platform-fee-amount (calculate-platform-fee (get fare ride-data)))
     (driver-payment (get fare ride-data))
     (driver-principal (unwrap! (get driver ride-data) err-not-found))
+    (token-principal (contract-of payment-token))
+    (token-type-val (get token-type escrow-data))
   )
     (asserts! (is-eq (some tx-sender) (get driver ride-data)) err-unauthorized)
     (asserts! (is-eq (get status ride-data) status-in-progress) err-invalid-status)
+    (asserts! (is-eq token-principal (get token escrow-data)) err-token-not-supported)
     
     ;; Driver becomes available again
     (update-location-demand (get pickup-location ride-data) 0 1)
     
-    ;; Transfer payment to driver
-    (try! (as-contract (stx-transfer? driver-payment tx-sender driver-principal)))
-    
-    ;; Transfer platform fee to contract owner
-    (try! (as-contract (stx-transfer? platform-fee-amount tx-sender contract-owner)))
+    ;; Transfer payment based on token type
+    (if (is-eq token-type-val token-type-stx)
+      (begin
+        (try! (as-contract (stx-transfer? driver-payment tx-sender driver-principal)))
+        (try! (as-contract (stx-transfer? platform-fee-amount tx-sender contract-owner)))
+      )
+      (begin
+        (unwrap! (as-contract (contract-call? payment-token transfer driver-payment tx-sender driver-principal none)) err-token-transfer-failed)
+        (unwrap! (as-contract (contract-call? payment-token transfer platform-fee-amount tx-sender contract-owner none)) err-token-transfer-failed)
+      )
+    )
     
     ;; Update ride status
     (map-set rides ride-id (merge ride-data {
@@ -349,28 +516,33 @@
   )
 )
 
-;; Cancel ride (rider or driver) - adjusts demand/supply
-(define-public (cancel-ride (ride-id uint))
+;; Cancel ride with multi-token refund support
+(define-public (cancel-ride (ride-id uint) (payment-token <sip-010-trait>))
   (let (
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
-    (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
+    (escrow-data (unwrap! (map-get? escrow-balances ride-id) err-not-found))
+    (escrowed-amount (get amount escrow-data))
+    (token-principal (contract-of payment-token))
+    (token-type-val (get token-type escrow-data))
   )
     (asserts! (or 
       (is-eq tx-sender (get rider ride-data))
       (is-eq (some tx-sender) (get driver ride-data))
     ) err-unauthorized)
     (asserts! (< (get status ride-data) status-in-progress) err-invalid-status)
+    (asserts! (is-eq token-principal (get token escrow-data)) err-token-not-supported)
     
     ;; Adjust demand/supply based on ride status
     (if (is-eq (get status ride-data) status-accepted)
-      ;; If ride was accepted, driver becomes available again and request is removed
       (update-location-demand (get pickup-location ride-data) -1 1)
-      ;; If ride was only requested, just remove the request
       (update-location-demand (get pickup-location ride-data) -1 0)
     )
     
-    ;; Refund to rider
-    (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
+    ;; Refund to rider based on token type
+    (if (is-eq token-type-val token-type-stx)
+      (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
+      (unwrap! (as-contract (contract-call? payment-token transfer escrowed-amount tx-sender (get rider ride-data) none)) err-token-transfer-failed)
+    )
     
     ;; Update ride status
     (map-set rides ride-id (merge ride-data {
@@ -434,7 +606,7 @@
       unregistered-at: (some stacks-block-height)
     }))
     
-    ;; Return stake after cooldown check (simplified - in production, would need separate withdrawal function)
+    ;; Return stake after cooldown check
     (try! (as-contract (stx-transfer? stake-amount tx-sender tx-sender)))
     
     (ok true)
@@ -502,29 +674,39 @@
   )
 )
 
-;; Finalize dispute
-(define-public (finalize-dispute (ride-id uint))
+;; Finalize dispute with multi-token support
+(define-public (finalize-dispute (ride-id uint) (payment-token <sip-010-trait>))
   (let (
     (dispute-data (unwrap! (map-get? disputes ride-id) err-not-found))
     (ride-data (unwrap! (map-get? rides ride-id) err-not-found))
+    (escrow-data (unwrap! (map-get? escrow-balances ride-id) err-not-found))
     (votes-for-rider (get votes-for-rider dispute-data))
     (votes-for-driver (get votes-for-driver dispute-data))
     (total-votes (+ votes-for-rider votes-for-driver))
-    (escrowed-amount (unwrap! (map-get? escrow-balances ride-id) err-not-found))
+    (escrowed-amount (get amount escrow-data))
+    (token-principal (contract-of payment-token))
+    (token-type-val (get token-type escrow-data))
   )
     (asserts! (is-eq (get status dispute-data) dispute-status-active) err-invalid-status)
     (asserts! (not (is-voting-period-active (get voting-ends-at dispute-data))) err-voting-period-active)
     (asserts! (> total-votes u0) err-invalid-status)
+    (asserts! (is-eq token-principal (get token escrow-data)) err-token-not-supported)
     
-    ;; Determine winner and process payment
+    ;; Determine winner and process payment based on token type
     (let (
       (resolution (if (> votes-for-rider votes-for-driver) vote-for-rider vote-for-driver))
     )
       (if (is-eq resolution vote-for-rider)
         ;; Refund to rider
-        (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
-        ;; Pay driver (platform fee already deducted in complete-ride)
-        (try! (as-contract (stx-transfer? escrowed-amount tx-sender (unwrap! (get driver ride-data) err-not-found))))
+        (if (is-eq token-type-val token-type-stx)
+          (try! (as-contract (stx-transfer? escrowed-amount tx-sender (get rider ride-data))))
+          (unwrap! (as-contract (contract-call? payment-token transfer escrowed-amount tx-sender (get rider ride-data) none)) err-token-transfer-failed)
+        )
+        ;; Pay driver
+        (if (is-eq token-type-val token-type-stx)
+          (try! (as-contract (stx-transfer? escrowed-amount tx-sender (unwrap! (get driver ride-data) err-not-found))))
+          (unwrap! (as-contract (contract-call? payment-token transfer escrowed-amount tx-sender (unwrap! (get driver ride-data) err-not-found) none)) err-token-transfer-failed)
+        )
       )
       
       ;; Update dispute status
@@ -546,8 +728,8 @@
 (define-public (update-surge-parameters (new-base-multiplier uint) (new-max-multiplier uint) (new-demand-threshold uint) (new-supply-threshold uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-    (asserts! (>= new-base-multiplier u5000) err-invalid-multiplier) ;; Min 0.5x
-    (asserts! (<= new-max-multiplier u100000) err-invalid-multiplier) ;; Max 10x
+    (asserts! (>= new-base-multiplier u5000) err-invalid-multiplier)
+    (asserts! (<= new-max-multiplier u100000) err-invalid-multiplier)
     (asserts! (< new-base-multiplier new-max-multiplier) err-invalid-multiplier)
     (asserts! (> new-demand-threshold u0) err-invalid-status)
     (asserts! (> new-supply-threshold u0) err-invalid-status)
@@ -565,6 +747,63 @@
 ;; Get ride details
 (define-read-only (get-ride (ride-id uint))
   (map-get? rides ride-id)
+)
+
+;; Get supported token info
+(define-read-only (get-token-info (token principal))
+  (map-get? supported-tokens token)
+)
+
+;; Check if token is supported and active
+(define-read-only (is-token-supported (token principal))
+  (match (map-get? supported-tokens token)
+    token-info (get is-active token-info)
+    false
+  )
+)
+
+;; Get token statistics
+(define-read-only (get-token-stats (token principal))
+  (map-get? token-stats token)
+)
+
+;; Get all token stats for analytics
+(define-read-only (get-token-volume (token principal))
+  (match (map-get? token-stats token)
+    stats (some (get total-volume stats))
+    none
+  )
+)
+
+;; Calculate fare in specific token
+(define-read-only (calculate-fare-in-token (base-fare uint) (location (string-ascii 100)) (token principal))
+  (let (
+    (token-info (unwrap! (map-get? supported-tokens token) err-token-not-supported))
+    (location-data (default-to 
+      {active-requests: u0, available-drivers: u0, last-updated: u0}
+      (map-get? location-demand location)
+    ))
+    (demand (get active-requests location-data))
+    (supply (get available-drivers location-data))
+    (surge-multiplier (calculate-surge-multiplier demand supply))
+    (final-fare-stx (apply-surge-pricing base-fare surge-multiplier))
+    (platform-fee-amount (calculate-platform-fee final-fare-stx))
+    (total-stx (+ final-fare-stx platform-fee-amount))
+  )
+    (if (not (get is-active token-info))
+      err-token-not-active
+      (ok {
+        base-fare: base-fare,
+        surge-multiplier: surge-multiplier,
+        final-fare-stx: final-fare-stx,
+        platform-fee: platform-fee-amount,
+        total-stx: total-stx,
+        token: token,
+        token-price: (get price-in-stx token-info),
+        estimated-token-amount: (convert-stx-to-token total-stx (get price-in-stx token-info))
+      })
+    )
+  )
 )
 
 ;; Get current surge pricing for location
@@ -608,8 +847,8 @@
 )
 
 ;; Get surge history for location and block
-(define-read-only (get-surge-history (location (string-ascii 100)) (target-block uint))
-  (map-get? surge-history {location: location, block-height: target-block})
+(define-read-only (get-surge-history (location (string-ascii 100)) (block-number uint))
+  (map-get? surge-history {location: location, block-height: block-number})
 )
 
 ;; Get driver rating
